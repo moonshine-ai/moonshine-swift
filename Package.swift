@@ -16,15 +16,15 @@ let package = Package(
             // Uncomment this to use the locally-built XCFramework
             // path: "Moonshine.xcframework",
             url:
-                "https://github.com/moonshine-ai/moonshine-swift/releases/download/v0.0.25/Moonshine.xcframework.zip",
-            checksum: "28cbe9cfccef18869a526bb7adf73e358028348e9b1c0ebdb5cfe438886d8909"
+                "https://github.com/moonshine-ai/moonshine-swift/releases/download/v0.0.26/Moonshine.xcframework.zip",
+            checksum: "388490fe9ecd0c60e98bcc644f42b312eb14286f94204b0e60c1dd0097f78c14"
         ),
         .target(
             name: "MoonshineVoice",
             dependencies: ["Moonshine"],
             path: "Sources/MoonshineVoice",
             linkerSettings: [
-                .unsafeFlags(["-lc++"])
+                .linkedLibrary("c++")
             ]
         ),
         .testTarget(
@@ -33,9 +33,6 @@ let package = Package(
             path: "Tests/MoonshineVoiceTests",
             resources: [
                 .copy("test-assets")
-            ],
-            linkerSettings: [
-                .unsafeFlags(["-lc++"])
             ]
         ),
     ]
