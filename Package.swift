@@ -8,7 +8,7 @@ let package = Package(
         .macOS(.v13),
     ],
     products: [
-        .library(name: "Moonshine", targets: ["MoonshineVoice"])
+        .library(name: "Moonshine", type: .static, targets: ["MoonshineVoice"])
     ],
     targets: [
         .binaryTarget(
@@ -16,8 +16,8 @@ let package = Package(
             // Uncomment this to use the locally-built XCFramework
             // path: "Moonshine.xcframework",
             url:
-                "https://github.com/moonshine-ai/moonshine-swift/releases/download/v0.0.26/Moonshine.xcframework.zip",
-            checksum: "388490fe9ecd0c60e98bcc644f42b312eb14286f94204b0e60c1dd0097f78c14"
+                "https://github.com/moonshine-ai/moonshine-swift/releases/download/v0.0.27/Moonshine.xcframework.zip",
+            checksum: "293cb68cb2adcf8e097e87a0fe6e45dce3405e641fcc555d7c9a95a461608c3c"
         ),
         .target(
             name: "MoonshineVoice",
