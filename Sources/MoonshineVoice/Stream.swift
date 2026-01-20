@@ -10,10 +10,8 @@ public class Stream {
     private var listeners: [ListenerWrapper] = []
     private var streamTime: TimeInterval = 0.0
     private var lastUpdateTime: TimeInterval = 0.0
-    
-    /// Flags for transcription operations.
-    public static let flagForceUpdate: UInt32 = 1 << 0
-    
+    private var isActive_: Bool = false
+        
     internal init(
         transcriber: Transcriber,
         handle: Int32,
@@ -24,6 +22,7 @@ public class Stream {
         self.api = MoonshineAPI.shared
         self.handle = handle
         self.updateInterval = updateInterval
+        self.isActive_ = false
     }
     
     deinit {
@@ -33,26 +32,35 @@ public class Stream {
     /// Start the stream.
     public func start() throws {
         try api.startStream(transcriberHandle: transcriber.handle, streamHandle: handle)
+        isActive_ = true
     }
     
     /// Stop the stream.
     /// This will process any remaining audio and emit final events.
     public func stop() throws {
+        isActive_ = false
         try api.stopStream(transcriberHandle: transcriber.handle, streamHandle: handle)
         // There may be some audio left in the stream, so we need to transcribe it
         // to get the final transcript and emit events.
         do {
-            try updateTranscription(flags: 0)
+            try updateTranscription(flags: TranscribeStreamFlags.flagForceUpdate)
         } catch {
             emitError(error)
         }
     }
     
+    public func isActive() -> Bool {
+        return isActive_
+    }
+
     /// Add audio data to the stream.
     /// - Parameters:
     ///   - audioData: Array of PCM audio samples (float, -1.0 to 1.0)
     ///   - sampleRate: Sample rate in Hz (default: 16000)
     public func addAudio(_ audioData: [Float], sampleRate: Int32 = 16000) throws {
+        if !isActive_ {
+            return
+        }
         try api.addAudioToStream(
             transcriberHandle: transcriber.handle,
             streamHandle: handle,
@@ -71,7 +79,7 @@ public class Stream {
     }
     
     /// Manually update the transcription from the stream.
-    /// - Parameter flags: Flags for transcription (e.g., `Stream.flagForceUpdate`)
+    /// - Parameter flags: Flags for transcription (e.g., `TranscribeStreamFlags.flagForceUpdate`)
     /// - Returns: The current transcript
     @discardableResult
     public func updateTranscription(flags: UInt32 = 0) throws -> Transcript {
