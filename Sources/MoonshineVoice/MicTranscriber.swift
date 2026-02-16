@@ -150,9 +150,13 @@ public class MicTranscriber {
                 }
 
                 var error: NSError?
+                // Safety: buffer is used synchronously by converter.convert()
+                // on the same thread, so this capture is safe despite AVAudioPCMBuffer
+                // not conforming to Sendable.
+                nonisolated(unsafe) let sendableBuffer = buffer
                 let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
                     outStatus.pointee = .haveData
-                    return buffer
+                    return sendableBuffer
                 }
 
                 converter.convert(to: convertedBuffer, error: &error, withInputFrom: inputBlock)
