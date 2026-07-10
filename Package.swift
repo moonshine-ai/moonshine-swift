@@ -16,8 +16,8 @@ let package = Package(
             // Uncomment this to use the locally-built XCFramework
             // path: "Moonshine.xcframework",
             url:
-                "https://github.com/moonshine-ai/moonshine-swift/releases/download/v0.0.66/Moonshine.xcframework.zip",
-            checksum: "862fa3245ec0d87720fd0ad6941c920ca4fe8b840991f51e59f233bb9a404db6"
+                "https://github.com/moonshine-ai/moonshine-swift/releases/download/v0.0.67/Moonshine.xcframework.zip",
+            checksum: "71cd2d75b84b8375ff17f6d7531c70cfe79b2ad3c84e73ab7ea0c46fa5a8acd2"
         ),
         .target(
             name: "MoonshineVoice",
