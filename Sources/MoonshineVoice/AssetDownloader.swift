@@ -3,11 +3,15 @@ import Foundation
 /// Which model's files to resolve and download. Each case maps to one of the native dependency
 /// APIs (`moonshine_get_*_dependencies`), so the file list always comes from the library rather
 /// than being hardcoded here.
-public enum ModelSpec: Sendable {
+public enum ModelSpec: Sendable, Hashable {
     /// Speech-to-text transcription model. `modelArch` selects the architecture (nil = the default
     /// for the language); `includeSpelling` also fetches the alphanumeric spelling model when one
-    /// is published for the language.
-    case stt(language: String, modelArch: ModelArch? = nil, includeSpelling: Bool = false)
+    /// is published for the language. `includeWordTimestamps` also fetches the optional attention
+    /// decoder used by the `word_timestamps` transcriber option (roughly doubling the download);
+    /// leave it false unless you need word-level timestamps.
+    case stt(
+        language: String, modelArch: ModelArch? = nil, includeSpelling: Bool = false,
+        includeWordTimestamps: Bool = false)
     /// Text-to-speech voice. `voice` is a prefixed id (e.g. `kokoro_af_heart`,
     /// `piper_en_US-lessac-medium`); nil uses the language default.
     case tts(language: String, voice: String? = nil)
@@ -32,7 +36,7 @@ public struct DownloadProgress: Sendable {
 }
 
 /// Downloads the model/data files a Moonshine engine needs into an app-chosen directory, then hands
-/// back that directory for loading with ``Transcriber``, ``TextToSpeech``, or ``IntentRecognizer``.
+/// back that directory for loading with ``Transcriber``, ``MicTranscriber``, or ``TextToSpeech``.
 ///
 /// This is **opt-in**: apps that bundle their models never need it, and default behavior is
 /// unchanged. Downloads are resolved from the native dependency catalog, written atomically (via a
@@ -129,17 +133,22 @@ public final class AssetDownloader: @unchecked Sendable {
     private struct ResolvedFile {
         let url: URL
         let relativePath: String
+        /// Expected size in bytes, or -1 when the manifest did not report one.
+        var expectedSize: Int64 = -1
     }
 
     private func resolveFiles(root: URL, spec: ModelSpec) throws -> [ResolvedFile] {
         switch spec {
-        case .stt(let language, let modelArch, let includeSpelling):
+        case .stt(let language, let modelArch, let includeSpelling, let includeWordTimestamps):
             var options: [TranscriberOption] = []
             if let modelArch = modelArch {
                 options.append(TranscriberOption(name: "model_arch", value: String(modelArch.rawValue)))
             }
             if includeSpelling {
                 options.append(TranscriberOption(name: "include_spelling", value: "true"))
+            }
+            if includeWordTimestamps {
+                options.append(TranscriberOption(name: "word_timestamps", value: "true"))
             }
             let json = try api.getSttDependencies(language: language, options: options)
             return try filesFromGroupManifest(json)
@@ -171,9 +180,10 @@ public final class AssetDownloader: @unchecked Sendable {
         }
     }
 
-    /// Parses the `{"groups":[{"base_url":..,"files":[..]}]}` manifest emitted by the STT and intent
-    /// dependency APIs. Files are downloaded from `base_url + "/" + file` and stored under their bare
-    /// filename in the root.
+    /// Parses the `{"groups":[{"base_url":..,"files":[{...}]}]}` manifest emitted by the STT and
+    /// intent dependency APIs. Each `files` entry is an object carrying `name`, a fully-qualified
+    /// `url`, and optional `size` / `checksum` / `checksum_type`. Files are downloaded from their
+    /// `url` (falling back to `base_url + "/" + name`) and stored under their bare filename.
     private func filesFromGroupManifest(_ json: String) throws -> [ResolvedFile] {
         guard let data = json.data(using: .utf8),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -184,15 +194,22 @@ public final class AssetDownloader: @unchecked Sendable {
         var result: [ResolvedFile] = []
         for group in groups {
             guard let baseURLString = group["base_url"] as? String,
-                let files = group["files"] as? [String]
+                let files = group["files"] as? [[String: Any]]
             else {
                 throw AssetDownloadError.invalidManifest(detail: "malformed group in \(json)")
             }
             for file in files {
-                guard let url = URL(string: baseURLString + "/" + file) else {
-                    throw AssetDownloadError.invalidManifest(detail: "bad URL for \(file)")
+                guard let name = file["name"] as? String else {
+                    throw AssetDownloadError.invalidManifest(detail: "file without a name in \(json)")
                 }
-                result.append(ResolvedFile(url: url, relativePath: file))
+                let urlString = (file["url"] as? String) ?? (baseURLString + "/" + name)
+                guard let url = URL(string: urlString) else {
+                    throw AssetDownloadError.invalidManifest(detail: "bad URL for \(name)")
+                }
+                // `size` is a JSON number (or null when unknown).
+                let expectedSize = (file["size"] as? NSNumber)?.int64Value ?? -1
+                result.append(
+                    ResolvedFile(url: url, relativePath: name, expectedSize: expectedSize))
             }
         }
         return result
@@ -285,7 +302,13 @@ public final class AssetDownloader: @unchecked Sendable {
         }
 
         let remainingBytes = http.expectedContentLength  // -1 if unknown
-        let totalBytes = remainingBytes >= 0 ? existingBytes + remainingBytes : -1
+        // Prefer the server's Content-Length; fall back to the catalog's expected
+        // size (from the manifest) so progress UI still has a total when the
+        // server doesn't report one.
+        let totalBytes =
+            remainingBytes >= 0
+            ? existingBytes + remainingBytes
+            : file.expectedSize
 
         try ensureSpaceAvailable(forVolumeAt: directory, needBytes: remainingBytes, url: file.url)
 
@@ -364,9 +387,20 @@ public final class AssetDownloader: @unchecked Sendable {
     private func ensureSpaceAvailable(forVolumeAt directory: URL, needBytes: Int64, url: URL) throws {
         guard needBytes > 0 else { return }
         let values = try? directory.resourceValues(forKeys: [
-            .volumeAvailableCapacityForImportantUsageKey
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeAvailableCapacityKey,
         ])
-        guard let available = values?.volumeAvailableCapacityForImportantUsage else { return }
+        // Prefer the important-usage figure, which counts space macOS/iOS could purge on our
+        // behalf. It is not always populated, though: some Macs report 0 for every path on the
+        // boot volume with tens of gigabytes genuinely free, which would refuse every download.
+        // So a non-positive answer means "unknown" here, not "full": fall back to the plain
+        // available capacity, and skip the check entirely if that is unavailable too. This is
+        // only a courtesy check -- an actual out-of-space condition still surfaces from the
+        // write itself as .fileWrite.
+        let important = values?.volumeAvailableCapacityForImportantUsage ?? 0
+        let available =
+            important > 0 ? important : Int64(values?.volumeAvailableCapacity ?? 0)
+        guard available > 0 else { return }
         // Keep a small safety margin so we do not fill the volume completely.
         let margin: Int64 = 8 * 1024 * 1024
         if available < needBytes + margin {
