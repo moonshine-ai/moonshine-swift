@@ -15,10 +15,13 @@ public enum ModelSpec: Sendable, Hashable {
     /// Text-to-speech voice. `voice` is a prefixed id (e.g. `kokoro_af_heart`,
     /// `piper_en_US-lessac-medium`); nil uses the language default.
     case tts(language: String, voice: String? = nil)
-    /// Intent-recognition embedding model. `variant` is e.g. `q4` (nil = default).
-    case intent(modelName: String = "embeddinggemma-300m", variant: String? = nil)
+    /// Text embedding model. `variant` is e.g. `q4` (nil = default).
+    case embedding(modelName: String = "embeddinggemma-300m", variant: String? = nil)
     /// Grapheme-to-phoneme assets for a language (lexicons / ONNX bundles).
     case g2p(language: String)
+    /// Speaker diarization models, needed by the `identify_speakers` transcriber option. There
+    /// is one set and it has no variants. About 8.2 MB.
+    case diarization
 }
 
 /// Progress for a single file within an ``AssetDownloader`` run.
@@ -153,13 +156,16 @@ public final class AssetDownloader: @unchecked Sendable {
             let json = try api.getSttDependencies(language: language, options: options)
             return try filesFromGroupManifest(json)
 
-        case .intent(let modelName, let variant):
+        case .embedding(let modelName, let variant):
             var options: [TranscriberOption] = []
             if let variant = variant {
                 options.append(TranscriberOption(name: "variant", value: variant))
             }
-            let json = try api.getIntentDependencies(modelName: modelName, options: options)
+            let json = try api.getEmbeddingDependencies(modelName: modelName, options: options)
             return try filesFromGroupManifest(json)
+
+        case .diarization:
+            return try filesFromGroupManifest(api.getDiarizationDependencies())
 
         case .tts(let language, let voice):
             var options: [TranscriberOption] = [
@@ -169,7 +175,7 @@ public final class AssetDownloader: @unchecked Sendable {
                 options.append(TranscriberOption(name: "voice", value: voice))
             }
             let json = try api.getTtsDependencies(languages: language, options: options)
-            return try filesFromKeyArray(json)
+            return try filesFromGroupManifest(json)
 
         case .g2p(let language):
             let options: [TranscriberOption] = [
@@ -181,7 +187,7 @@ public final class AssetDownloader: @unchecked Sendable {
     }
 
     /// Parses the `{"groups":[{"base_url":..,"files":[{...}]}]}` manifest emitted by the STT and
-    /// intent dependency APIs. Each `files` entry is an object carrying `name`, a fully-qualified
+    /// embedding dependency APIs. Each `files` entry is an object carrying `name`, a fully-qualified
     /// `url`, and optional `size` / `checksum` / `checksum_type`. Files are downloaded from their
     /// `url` (falling back to `base_url + "/" + name`) and stored under their bare filename.
     private func filesFromGroupManifest(_ json: String) throws -> [ResolvedFile] {
@@ -215,7 +221,7 @@ public final class AssetDownloader: @unchecked Sendable {
         return result
     }
 
-    /// Parses the flat JSON array of canonical keys emitted by the TTS dependency API.
+    /// Prefer ``filesFromGroupManifest`` for TTS now that the C API returns groups.
     private func filesFromKeyArray(_ json: String) throws -> [ResolvedFile] {
         guard let data = json.data(using: .utf8),
             let keys = try? JSONSerialization.jsonObject(with: data) as? [String]

@@ -138,9 +138,12 @@ internal final class MoonshineAPI: @unchecked Sendable {
     func extractSpeechClip(
         audioData: [Float],
         sampleRate: Int32,
+        ttsSynthesizerHandle: Int32,
         clipDurationSeconds: Float,
         minimumSpeechSeconds: Float
-    ) throws -> (audio: [Float]?, startTime: Float, speechDuration: Float) {
+    ) throws -> (
+        audio: [Float]?, startTime: Float, speechDuration: Float, transcript: String?
+    ) {
         let options = [
             TranscriberOption(
                 name: "clip_duration_seconds", value: String(clipDurationSeconds)),
@@ -164,6 +167,7 @@ internal final class MoonshineAPI: @unchecked Sendable {
                         audio.baseAddress,
                         UInt64(audioData.count),
                         sampleRate,
+                        ttsSynthesizerHandle,
                         opts.baseAddress,
                         UInt64(options.count),
                         &clip
@@ -173,12 +177,18 @@ internal final class MoonshineAPI: @unchecked Sendable {
         }
         try checkError(error)
 
+        var transcript: String?
+        if let transcriptPtr = clip.transcript {
+            transcript = String(cString: transcriptPtr)
+            moonshine_free_buffer(transcriptPtr)
+        }
+
         guard clip.is_complete != 0, let samples = clip.audio_data, clip.audio_length > 0 else {
-            return (nil, clip.start_time, clip.speech_duration)
+            return (nil, clip.start_time, clip.speech_duration, transcript)
         }
         let audio = Array(UnsafeBufferPointer(start: samples, count: Int(clip.audio_length)))
         moonshine_free_buffer(samples)
-        return (audio, clip.start_time, clip.speech_duration)
+        return (audio, clip.start_time, clip.speech_duration, transcript)
     }
 
     /// Create a stream for real-time transcription.
@@ -342,7 +352,8 @@ internal final class MoonshineAPI: @unchecked Sendable {
                 haveSpeakersChanged: lineC.have_speakers_changed != 0,
                 speakerSpans: speakerSpans,
                 audioData: audioData,
-                words: words
+                words: words,
+                lastTranscriptionLatencyMs: lineC.last_transcription_latency_ms
             )
             lines.append(line)
         }
@@ -728,12 +739,12 @@ internal final class MoonshineAPI: @unchecked Sendable {
         }(options)
     }
 
-    /// Get the intent-recognition embedding model download manifest as a JSON object string.
+    /// Get the embedding model download manifest as a JSON object string.
     ///
     /// - Parameters:
     ///   - modelName: Embedding model id, or `nil` to use the default model.
     ///   - options: Optional options; recognizes `variant`.
-    func getIntentDependencies(
+    func getEmbeddingDependencies(
         modelName: String?,
         options: [TranscriberOption]? = nil
     ) throws -> String {
@@ -741,8 +752,21 @@ internal final class MoonshineAPI: @unchecked Sendable {
             primaryArg: modelName,
             emptyResult: "{}"
         ) { primaryC, optsPtr, optsCount, outPtr in
-            moonshine_get_intent_dependencies(primaryC, optsPtr, optsCount, outPtr)
+            moonshine_get_embedding_dependencies(primaryC, optsPtr, optsCount, outPtr)
         }(options)
+    }
+
+    /// Get the speaker diarization download manifest as a JSON object string. There is one set of
+    /// models and it takes no options, so this does not go through `stringOutDependencyCall`.
+    func getDiarizationDependencies() throws -> String {
+        var outJson: UnsafeMutablePointer<CChar>? = nil
+        try checkError(moonshine_get_diarization_dependencies(&outJson))
+        guard let jsonPtr = outJson else {
+            return "{}"
+        }
+        let result = String(cString: jsonPtr)
+        free(outJson)
+        return result
     }
 
     /// Shared plumbing for the `moonshine_get_*_dependencies` family: marshals the primary string
@@ -791,124 +815,74 @@ internal final class MoonshineAPI: @unchecked Sendable {
         }
     }
 
-    // MARK: - Intent recognition
+    // MARK: - Text embeddings
 
-    func createIntentRecognizer(
+    func createEmbeddingModel(
         modelPath: String,
         embeddingModelArch: UInt32,
         modelVariant: String = "q4"
     ) throws -> Int32 {
         let pathC = modelPath.cString(using: .utf8)!
         let variantC = modelVariant.cString(using: .utf8)!
-        let handle = moonshine_create_intent_recognizer(
+        let handle = moonshine_create_embedding_model(
             pathC, embeddingModelArch, variantC)
         if handle < 0 {
             throw MoonshineError.custom(
-                message: "Failed to create intent recognizer: \(errorToString(handle))",
+                message: "Failed to create embedding model: \(errorToString(handle))",
                 code: handle)
         }
         return handle
     }
 
-    func freeIntentRecognizer(_ handle: Int32) {
-        moonshine_free_intent_recognizer(handle)
+    func freeEmbeddingModel(_ handle: Int32) {
+        moonshine_free_embedding_model(handle)
     }
 
-    func registerIntentRecognizerIntent(handle: Int32, canonicalPhrase: String,
-                                        embedding: UnsafeMutablePointer<Float>? = nil,
-                                        embeddingSize: UInt64 = 0,
-                                        priority: Int32 = 0) throws {
-        let phraseC = canonicalPhrase.cString(using: .utf8)!
-        try checkError(moonshine_register_intent(handle, phraseC, embedding, embeddingSize, priority))
-    }
-
-    /// - Returns: `true` if an intent was removed, `false` if the phrase was not registered.
-    func unregisterIntentRecognizerIntent(handle: Int32, canonicalPhrase: String) throws -> Bool {
-        let phraseC = canonicalPhrase.cString(using: .utf8)!
-        let err = moonshine_unregister_intent(handle, phraseC)
-        if err == 0 {
-            return true
-        }
-        if err == -3 {
-            return false
-        }
-        try checkError(err)
-        return false
-    }
-
-    func getClosestIntents(
-        intentRecognizerHandle: Int32,
-        utterance: String,
-        toleranceThreshold: Float
-    ) throws -> [(canonicalPhrase: String, similarity: Float)] {
-        var matchesPtr: UnsafeMutablePointer<moonshine_intent_match_t>? = nil
+    /// Embed `sentence` with the model behind `handle`.
+    func calculateEmbedding(handle: Int32, sentence: String) throws -> [Float] {
+        var embeddingPtr: UnsafeMutablePointer<Float>? = nil
         var count: UInt64 = 0
-        let err: Int32 = utterance.withCString { utterC in
-            withUnsafeMutablePointer(to: &matchesPtr) { matchesPP in
+        let err: Int32 = sentence.withCString { sentenceC in
+            withUnsafeMutablePointer(to: &embeddingPtr) { embeddingPP in
                 withUnsafeMutablePointer(to: &count) { countP in
-                    moonshine_get_closest_intents(
-                        intentRecognizerHandle,
-                        utterC,
-                        toleranceThreshold,
-                        matchesPP,
-                        countP
-                    )
+                    moonshine_calculate_embedding(
+                        handle, sentenceC, embeddingPP, countP, nil)
                 }
             }
         }
         try checkError(err)
-        let n = Int(count)
-        var out: [(canonicalPhrase: String, similarity: Float)] = []
-        if let base = matchesPtr, n > 0 {
-            for i in 0..<n {
-                let row = base[i]
-                let phrase: String
-                if let p = row.canonical_phrase {
-                    phrase = String(cString: p)
-                } else {
-                    phrase = ""
-                }
-                out.append((phrase, row.similarity))
-            }
+        var out: [Float] = []
+        if let base = embeddingPtr, count > 0 {
+            out = Array(UnsafeBufferPointer(start: base, count: Int(count)))
         }
-        moonshine_free_intent_matches(matchesPtr, count)
+        moonshine_free_embedding(embeddingPtr)
         return out
     }
 
-    func getIntentRecognizerIntentCount(handle: Int32) throws -> Int32 {
-        let n = moonshine_get_intent_count(handle)
-        if n < 0 {
-            try checkError(n)
+    /// Cosine similarity between two embeddings of equal length, in `-1...1`.
+    func calculateEmbeddingDistance(
+        handle: Int32,
+        embeddingA: [Float],
+        embeddingB: [Float]
+    ) throws -> Float {
+        guard embeddingA.count == embeddingB.count, !embeddingA.isEmpty else {
+            throw MoonshineError.custom(
+                message: "Embedding sizes differ: \(embeddingA.count) vs \(embeddingB.count)",
+                code: Int32(-3))  // MOONSHINE_ERROR_INVALID_ARGUMENT
         }
-        return n
-    }
-
-    func clearIntentRecognizerIntents(handle: Int32) throws {
-        try checkError(moonshine_clear_intents(handle))
-    }
-
-    func calculateIntentEmbedding(handle: Int32, sentence: String) throws -> [Float] {
-        var outPtr: UnsafeMutablePointer<Float>? = nil
-        var outSize: UInt64 = 0
-        let err: Int32 = sentence.withCString { sentenceC in
-            withUnsafeMutablePointer(to: &outPtr) { embPP in
-                withUnsafeMutablePointer(to: &outSize) { sizeP in
-                    moonshine_calculate_intent_embedding(
-                        handle, sentenceC, embPP, sizeP, nil)
-                }
+        var similarity: Float = 0
+        let err: Int32 = embeddingA.withUnsafeBufferPointer { bufA in
+            embeddingB.withUnsafeBufferPointer { bufB in
+                moonshine_calculate_embedding_distance(
+                    handle,
+                    bufA.baseAddress,
+                    bufB.baseAddress,
+                    UInt64(embeddingA.count),
+                    &similarity)
             }
         }
         try checkError(err)
-        let n = Int(outSize)
-        var result = [Float]()
-        if let base = outPtr, n > 0 {
-            result.reserveCapacity(n)
-            for i in 0..<n {
-                result.append(base[i])
-            }
-            moonshine_free_intent_embedding(base)
-        }
-        return result
+        return similarity
     }
 }
 

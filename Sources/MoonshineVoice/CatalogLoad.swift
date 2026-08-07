@@ -40,14 +40,45 @@ extension Transcriber {
             includeWordTimestamps: includeWordTimestamps)
         let directory = try resolveDirectory(for: spec, override: cacheDirectory)
         _ = try await downloader.ensureModelPresent(root: directory, spec: spec, onProgress: onProgress)
-        return try Transcriber(modelPath: directory.path, modelArch: modelArch, options: options)
+        let resolvedOptions = try await withDiarizationModels(
+            options, downloader: downloader, onProgress: onProgress)
+        return try Transcriber(
+            modelPath: directory.path, modelArch: modelArch, options: resolvedOptions)
     }
 }
 
+/// Whether `options` asks for speaker IDs, reading the value the way the C API does.
+private func wantsSpeakerIds(_ options: [TranscriberOption]?) -> Bool {
+    guard let option = options?.last(where: { $0.name == "identify_speakers" }) else {
+        return false
+    }
+    let value = option.value.trimmingCharacters(in: .whitespaces).lowercased()
+    return value == "true" || value == "1"
+}
+
+/// Downloads the diarization models and appends `diarization_model_dir` when the caller asked for
+/// speaker IDs without saying where the models are. They are a download rather than part of the
+/// library, and the transcriber refuses to construct without them.
 @available(iOS 15.0, macOS 12.0, *)
-extension IntentRecognizer {
-    /// Downloads the intent-recognition embedding model (if not already present) and returns a
-    /// ready ``IntentRecognizer``.
+func withDiarizationModels(
+    _ options: [TranscriberOption]?,
+    downloader: AssetDownloader,
+    onProgress: (@Sendable (DownloadProgress) -> Void)?
+) async throws -> [TranscriberOption]? {
+    guard wantsSpeakerIds(options) else { return options }
+    if options?.contains(where: { $0.name == "diarization_model_dir" }) == true { return options }
+    let spec = ModelSpec.diarization
+    let directory = try ModelCache.directory(for: spec)
+    _ = try await downloader.ensureModelPresent(
+        root: directory, spec: spec, onProgress: onProgress)
+    return (options ?? [])
+        + [TranscriberOption(name: "diarization_model_dir", value: directory.path)]
+}
+
+@available(iOS 15.0, macOS 12.0, *)
+extension EmbeddingModel {
+    /// Downloads the embedding model (if not already present) and returns a
+    /// ready ``EmbeddingModel``.
     static func load(
         modelName: String = "embeddinggemma-300m",
         modelArch: EmbeddingModelArch = .gemma300m,
@@ -55,11 +86,11 @@ extension IntentRecognizer {
         cacheDirectory: URL? = nil,
         downloader: AssetDownloader = AssetDownloader(),
         onProgress: (@Sendable (DownloadProgress) -> Void)? = nil
-    ) async throws -> IntentRecognizer {
-        let spec = ModelSpec.intent(modelName: modelName, variant: variant)
+    ) async throws -> EmbeddingModel {
+        let spec = ModelSpec.embedding(modelName: modelName, variant: variant)
         let directory = try resolveDirectory(for: spec, override: cacheDirectory)
         _ = try await downloader.ensureModelPresent(root: directory, spec: spec, onProgress: onProgress)
-        return try IntentRecognizer(
+        return try EmbeddingModel(
             modelPath: directory.path, modelArch: modelArch, modelVariant: variant)
     }
 }
@@ -71,7 +102,7 @@ public enum Moonshine {
     /// the whole batch, and returns the directory each spec was written to.
     ///
     /// Useful for apps that need several models before they can start (e.g. an ASR model plus an
-    /// intent-embedding model): download them up front with a single progress handler, then
+    /// embedding model): download them up front with a single progress handler, then
     /// construct each engine from the returned directory. Because ``ModelCache`` keys are stable,
     /// the per-engine `load` factories will find these files already present.
     @discardableResult

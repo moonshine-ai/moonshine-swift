@@ -45,8 +45,6 @@ public class TextToSpeech: @unchecked Sendable {
     /// The clip the current voice was cloned from, if any.
     private var cloneSamples: [Float]?
     private var cloneTranscript: String?
-    /// Loaded lazily, the first time a clone clip needs transcribing.
-    private var clipTranscriber: Transcriber?
 
     private let sayLock = NSLock()
     private var sayEngine: AVAudioEngine?
@@ -76,10 +74,16 @@ public class TextToSpeech: @unchecked Sendable {
 
     /// Canonical asset key under which a ZipVoice clone reference clip is supplied.
     private static let cloneAudioKey = "zipvoice/clone_audio"
-    /// The only engine that can clone an arbitrary reference voice.
+    /// Engine name used when creating ZipVoice from a captured clone clip.
     private static let cloneVoice = "zipvoice"
+    /// Built-in ZipVoice voice used by ``cloning(_:)`` before a clip exists.
+    private static let clonePresetVoice = "zipvoice_american_female"
     /// Reference clips are resampled to this rate before cloning.
     private static let cloneSampleRate: Int32 = 16000
+    /// How long a freshly started audio engine is given to render its first buffers.
+    /// A healthy device takes tens of milliseconds even on a loaded machine; one that
+    /// has not started by now never will.
+    private static let renderCycleTimeout: TimeInterval = 2.0
 
     /// Creates a synthesizer that has not loaded any assets yet.
     ///
@@ -196,10 +200,12 @@ public class TextToSpeech: @unchecked Sendable {
         return self
     }
 
-    /// Voice id, e.g. `"kokoro_af_heart"`. Defaults to the engine's own default.
+    /// Catalog voice id, e.g. `"kokoro_af_heart"`. Clears ``cloning(_:)`` — a
+    /// synthesizer is either a catalog voice or a cloning engine.
     @discardableResult
     public func voice(_ id: String) -> Self {
         voiceId = id
+        cloningWanted = false
         return self
     }
 
@@ -210,11 +216,14 @@ public class TextToSpeech: @unchecked Sendable {
         return self
     }
 
-    /// Fetches the cloning engine during ``load()`` rather than on the first
-    /// ``cloneFrom(_:transcript:)``, so the first clone is quick.
+    /// Create this synthesizer as a ZipVoice cloning engine. Call before
+    /// ``load()`` so ZipVoice and clone-ASR assets are fetched up front.
+    /// Clears ``voice(_:)``. Only then may ``cloneFrom`` / ``startCloning``
+    /// be used.
     @discardableResult
     public func cloning(_ enabled: Bool = true) -> Self {
         cloningWanted = enabled
+        if enabled { voiceId = nil }
         return self
     }
 
@@ -235,13 +244,11 @@ public class TextToSpeech: @unchecked Sendable {
     // MARK: - Loading
 
     /// Downloads the voice assets if needed and prepares the synthesizer.
+    /// With ``cloning(_:)``, ZipVoice and clone ASR are both fetched here.
     @available(iOS 15.0, macOS 12.0, *)
     public func load() async throws {
         if cloningWanted, cloneSamples == nil {
-            // The cloning engine can't exist until there's a voice to clone, so
-            // all load() can usefully do is fetch its assets into the cache that
-            // the first cloneFrom() reads from.
-            _ = try await ensureAssets(voice: Self.cloneVoice)
+            try await build(voice: Self.clonePresetVoice)
             return
         }
         try await build(voice: voiceId)
@@ -283,16 +290,16 @@ public class TextToSpeech: @unchecked Sendable {
     }
 
     /// Clones the voice in `samples` (mono float PCM in -1..1).
+    /// Requires ``cloning(_:)`` before ``load()``.
     @available(iOS 15.0, macOS 12.0, *)
     public func cloneFrom(
         samples: [Float], sampleRate: Int32, transcript: String? = nil
     ) async throws {
+        try requireCloningMode(what: "cloneFrom")
         let clip = try clipForCloning(samples: samples, sampleRate: sampleRate)
         cloneSamples = clip
         if let transcript {
             cloneTranscript = transcript
-        } else {
-            cloneTranscript = await transcribeClip(clip)
         }
         try await build(voice: Self.cloneVoice)
     }
@@ -306,19 +313,45 @@ public class TextToSpeech: @unchecked Sendable {
                     "That VoiceClone has not captured enough speech yet — wait for onReady.",
                 code: -1)
         }
+        var resolved = transcript
+        if resolved == nil || resolved?.isEmpty == true {
+            resolved = clone.transcript
+        }
         try await cloneFrom(
-            samples: audio, sampleRate: clone.sampleRate, transcript: transcript)
+            samples: audio, sampleRate: clone.sampleRate, transcript: resolved)
     }
 
     /// Starts capturing a reference voice from the microphone, for cloning.
-    /// The returned object reports when it has heard enough.
+    /// Requires ``cloning(_:)`` before ``load()``.
     public func startCloning(
         clipDurationSeconds: Float = 4, minimumSpeechSeconds: Float = 2
     ) -> VoiceClone {
+        do {
+            try requireCloningMode(what: "startCloning")
+        } catch {
+            fatalError("\(error)")
+        }
+        guard handle >= 0 else {
+            fatalError("Call load() before startCloning().")
+        }
         return VoiceClone(
+            ttsHandle: handle,
             clipDurationSeconds: clipDurationSeconds,
             minimumSpeechSeconds: minimumSpeechSeconds)
     }
+
+    private func requireCloningMode(what: String) throws {
+        guard cloningWanted else {
+            throw MoonshineError.custom(
+                message:
+                    "Call cloning() before load() to use \(what). "
+                    + "Catalog voices and cloning are separate synthesizer modes.",
+                code: -1)
+        }
+    }
+
+    /// Exposed for tests that need a synthesizer handle for extractSpeechClip.
+    internal var synthesizerHandle: Int32 { handle }
 
     /// Synthesize text to mono PCM float samples and sample rate, without
     /// playing it. Use ``say(_:options:)`` to hear it instead.
@@ -334,9 +367,7 @@ public class TextToSpeech: @unchecked Sendable {
     ) throws -> TtsSynthesisResult {
         guard handle >= 0 else {
             throw MoonshineError.custom(
-                message: cloningWanted
-                    ? "Call cloneFrom() before synthesizing with a cloned voice."
-                    : "Call load() before synthesizing.",
+                message: "Call load() before synthesizing.",
                 code: -1)
         }
         return try api.textToSpeech(
@@ -373,9 +404,11 @@ public class TextToSpeech: @unchecked Sendable {
     ///
     /// Utterances are played in the order they were requested; synthesis of the
     /// next one is pipelined with playback of the current one, so several
-    /// concurrent `say` calls still come out in order without gaps. Call
-    /// ``stop()`` to cancel everything queued and halt the audio playing now,
-    /// which makes the pending calls return early.
+    /// concurrent `say` calls still come out in order without gaps. Long strings
+    /// are split on an approximate sentence boundary (`.`, `!`, `?`, or `:` followed
+    /// by whitespace) so the first sentence can start sooner. Call ``stop()`` to
+    /// cancel everything queued and halt the audio playing now, which makes the
+    /// pending calls return early.
     ///
     /// - Parameters:
     ///   - text: The text to speak.
@@ -403,7 +436,9 @@ public class TextToSpeech: @unchecked Sendable {
         _ text: String,
         options: [TranscriberOption]? = nil
     ) {
-        enqueueSay(text: text, deviceID: nil, options: options)
+        for sentence in Self.splitSayUtterances(text) {
+            enqueueSay(text: sentence, deviceID: nil, options: options)
+        }
     }
 
     #if os(macOS)
@@ -437,16 +472,73 @@ public class TextToSpeech: @unchecked Sendable {
     private func speak(
         _ text: String, deviceID: AudioDeviceID?, options: [TranscriberOption]?
     ) async throws {
-        guard !text.isEmpty else { return }
+        let sentences = Self.splitSayUtterances(text)
+        guard !sentences.isEmpty else { return }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            enqueueSay(text: text, deviceID: deviceID, options: options) { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
+            final class SpeakState: @unchecked Sendable {
+                let lock = NSLock()
+                var remaining: Int
+                var firstError: Error?
+                init(remaining: Int) { self.remaining = remaining }
+            }
+            let state = SpeakState(remaining: sentences.count)
+            for sentence in sentences {
+                enqueueSay(text: sentence, deviceID: deviceID, options: options) { error in
+                    state.lock.lock()
+                    if let error, state.firstError == nil {
+                        state.firstError = error
+                    }
+                    state.remaining -= 1
+                    let done = state.remaining == 0
+                    let failure = state.firstError
+                    state.lock.unlock()
+                    if done {
+                        if let failure {
+                            continuation.resume(throwing: failure)
+                        } else {
+                            continuation.resume()
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Approximate sentence split for ``say``: break on `.` / `!` / `?` / `:`
+    /// followed by whitespace so the first clause can start sooner.
+    static func splitSayUtterances(_ text: String) -> [String] {
+        let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stripped.isEmpty else { return [] }
+        var parts: [String] = []
+        var start = stripped.startIndex
+        var i = stripped.startIndex
+        while i < stripped.endIndex {
+            let ch = stripped[i]
+            let next = stripped.index(after: i)
+            if (ch == "." || ch == "!" || ch == "?" || ch == ":"),
+                next < stripped.endIndex,
+                stripped[next].isWhitespace
+            {
+                let end = next
+                var j = next
+                while j < stripped.endIndex, stripped[j].isWhitespace {
+                    j = stripped.index(after: j)
+                }
+                let piece = stripped[start..<end].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !piece.isEmpty {
+                    parts.append(String(piece))
+                }
+                start = j
+                i = j
+                continue
+            }
+            i = next
+        }
+        let tail = stripped[start...].trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty {
+            parts.append(String(tail))
+        }
+        return parts
     }
 
     /// Block until all queued utterances have been synthesized and played.
@@ -561,11 +653,15 @@ public class TextToSpeech: @unchecked Sendable {
     /// Trims a reference recording to the few seconds of speech ZipVoice wants,
     /// resampling to 16 kHz on the way.
     private func clipForCloning(samples: [Float], sampleRate: Int32) throws -> [Float] {
+        guard handle >= 0 else {
+            throw MoonshineError.custom(message: "Call load() before cloning.", code: -1)
+        }
         if sampleRate == Self.cloneSampleRate, samples.count <= Int(Self.cloneSampleRate) * 10 {
             return samples
         }
         if let audio = try api.extractSpeechClip(
-            audioData: samples, sampleRate: sampleRate, clipDurationSeconds: 4,
+            audioData: samples, sampleRate: sampleRate, ttsSynthesizerHandle: handle,
+            clipDurationSeconds: 4,
             minimumSpeechSeconds: 2
         ).audio {
             return audio
@@ -574,7 +670,8 @@ public class TextToSpeech: @unchecked Sendable {
         // window the detector found — a poor clone beats no clone for a caller
         // who explicitly handed us this recording.
         if let audio = try api.extractSpeechClip(
-            audioData: samples, sampleRate: sampleRate, clipDurationSeconds: 4,
+            audioData: samples, sampleRate: sampleRate, ttsSynthesizerHandle: handle,
+            clipDurationSeconds: 4,
             minimumSpeechSeconds: 0
         ).audio {
             return audio
@@ -583,31 +680,8 @@ public class TextToSpeech: @unchecked Sendable {
             message: "Couldn't find enough speech in that recording to clone from.", code: -1)
     }
 
-    /// Transcribes a clone clip so the vocoder knows what the reference voice
-    /// said. The speech-to-text model this needs is an implementation detail, so
-    /// it is loaded here rather than being the caller's problem. Cloning still
-    /// works without a transcript, just less faithfully, so a failure here is
-    /// swallowed rather than sinking the whole operation.
+    /// Downloads the largest catalog STT for clone ASR and returns its path and arch.
     @available(iOS 15.0, macOS 12.0, *)
-    private func transcribeClip(_ clip: [Float]) async -> String? {
-        do {
-            if clipTranscriber == nil {
-                clipTranscriber = try await Transcriber.load(
-                    language: sttLanguage(for: _language),
-                    modelArch: .base,
-                    onProgress: fractionReporter(progressHandler))
-            }
-            let transcript = try clipTranscriber?.transcribeWithoutStreaming(
-                audioData: clip, sampleRate: Self.cloneSampleRate)
-            let text =
-                transcript?.lines.map { $0.text }.joined(separator: " ").trimmingCharacters(
-                    in: .whitespacesAndNewlines) ?? ""
-            return text.isEmpty ? nil : text
-        } catch {
-            return nil
-        }
-    }
-
     // MARK: - Queue internals
 
     private func enqueueSay(
@@ -656,9 +730,16 @@ public class TextToSpeech: @unchecked Sendable {
             )
 
             self.playbackQueue.async { [self] in
-                defer { self.finish(completion, error: nil) }
-                guard self.isGenerationCurrent(gen) else { return }
-                self.playOneItem(item, generation: gen)
+                guard self.isGenerationCurrent(gen) else {
+                    self.finish(completion, error: nil)
+                    return
+                }
+                do {
+                    try self.playOneItem(item, generation: gen)
+                    self.finish(completion, error: nil)
+                } catch {
+                    self.finish(completion, error: error)
+                }
             }
         }
     }
@@ -685,7 +766,7 @@ public class TextToSpeech: @unchecked Sendable {
         pendingCondition.unlock()
     }
 
-    private func playOneItem(_ item: PlayItem, generation gen: UInt64) {
+    private func playOneItem(_ item: PlayItem, generation gen: UInt64) throws {
         let semaphore: DispatchSemaphore
 
         sayLock.lock()
@@ -693,7 +774,7 @@ public class TextToSpeech: @unchecked Sendable {
             _ = try obtainEngine(sampleRate: item.sampleRate, device: item.deviceID)
         } catch {
             sayLock.unlock()
-            return
+            throw error
         }
         guard let playerNode = sayPlayerNode else {
             sayLock.unlock()
@@ -766,7 +847,7 @@ public class TextToSpeech: @unchecked Sendable {
     /// - Parameters:
     ///   - languages: Comma-separated language tags. Pass an empty string for all.
     ///   - options: Optional options.
-    /// - Returns: JSON array string of canonical asset keys.
+    /// - Returns: JSON groups manifest of canonical asset files.
     /// - Throws: `MoonshineError` on failure.
     public static func getDependencies(
         languages: String,
@@ -792,8 +873,6 @@ public class TextToSpeech: @unchecked Sendable {
             api.freeTtsSynthesizer(handle)
             handle = -1
         }
-        clipTranscriber?.close()
-        clipTranscriber = nil
         if let buffer = cloneBuffer {
             buffer.deallocate()
             cloneBuffer = nil
@@ -850,11 +929,65 @@ public class TextToSpeech: @unchecked Sendable {
             )
         }
 
+        guard Self.waitForRenderCycle(engine) else {
+            engine.stop()
+            throw MoonshineError.custom(
+                message: "The audio output device started but is not playing anything. "
+                    + "This usually means the system's audio hardware is powered down, "
+                    + "as it is when a Mac is asleep.",
+                code: -1
+            )
+        }
+
         sayEngine = engine
         sayPlayerNode = playerNode
         sayCachedSampleRate = sampleRate
 
         return engine
+    }
+
+    /// Waits for `engine` to actually render audio, returning `false` if it never does.
+    ///
+    /// A started engine is not necessarily a playing one: when the output hardware is
+    /// powered down — a Mac in a maintenance dark wake with the lid shut, say — `start()`
+    /// succeeds but the device never delivers a render callback. Calling
+    /// `AVAudioPlayerNode.play()` in that state raises an Objective-C exception ("player
+    /// did not see an IO cycle") that Swift cannot catch, so it takes the process down
+    /// rather than surfacing as a `throw`. An advancing render time is the signal that
+    /// tells a playing engine from a stalled one, so wait for one here and let the caller
+    /// report an ordinary error instead.
+    private static func waitForRenderCycle(_ engine: AVAudioEngine) -> Bool {
+        let deadline = Date().addingTimeInterval(renderCycleTimeout)
+        var firstSampleTime: AVAudioFramePosition?
+        while Date() < deadline {
+            if let renderTime = engine.outputNode.lastRenderTime, renderTime.isSampleTimeValid {
+                if let firstSampleTime {
+                    if renderTime.sampleTime > firstSampleTime { return true }
+                } else {
+                    firstSampleTime = renderTime.sampleTime
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+        return false
+    }
+
+    /// Reports whether audio can be played on the default output device right now.
+    ///
+    /// Playback tests use this to skip rather than fail on a machine whose audio
+    /// hardware is asleep.
+    static func audioOutputIsLive() -> Bool {
+        let engine = AVAudioEngine()
+        // Referencing the main mixer is what connects it to the output node, so the
+        // graph has something to pull through once the engine starts.
+        _ = engine.mainMixerNode
+        do {
+            try engine.start()
+        } catch {
+            return false
+        }
+        defer { engine.stop() }
+        return waitForRenderCycle(engine)
     }
 
     private func releaseEngine() {

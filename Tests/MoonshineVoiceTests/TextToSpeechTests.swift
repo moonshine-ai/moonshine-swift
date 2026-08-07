@@ -167,8 +167,19 @@ final class TextToSpeechTests: XCTestCase {
 
     // MARK: - Say Tests
 
+    /// Playback needs audio hardware that is actually running, which is not a given
+    /// on an unattended machine: a Mac with the lid shut only wakes periodically for
+    /// maintenance, and during those dark wakes its audio devices stay powered down.
+    private static func requireLiveAudioOutput() throws {
+        try XCTSkipUnless(
+            TextToSpeech.audioOutputIsLive(),
+            "No audio output is running on this machine (it may be asleep); "
+                + "skipping playback test")
+    }
+
     func testSayDefaultDevice() async throws {
         let dataPath = try Self.getTtsDataPath()
+        try Self.requireLiveAudioOutput()
         let tts = try TextToSpeech(language: "en_us", g2pRoot: dataPath)
         defer { tts.close() }
 
@@ -180,12 +191,29 @@ final class TextToSpeechTests: XCTestCase {
 
     func testSayMultipleCalls() async throws {
         let dataPath = try Self.getTtsDataPath()
+        try Self.requireLiveAudioOutput()
         let tts = try TextToSpeech(language: "en_us", g2pRoot: dataPath)
         defer { tts.close() }
 
         // Verify the engine caching works across repeated calls.
         try await tts.say(["First.", "Second.", "Third."])
         XCTAssertFalse(tts.isTalking())
+    }
+
+    func testSplitSayUtterances() {
+        XCTAssertEqual(TextToSpeech.splitSayUtterances(""), [])
+        XCTAssertEqual(TextToSpeech.splitSayUtterances("Hello"), ["Hello"])
+        XCTAssertEqual(TextToSpeech.splitSayUtterances("Hello."), ["Hello."])
+        XCTAssertEqual(
+            TextToSpeech.splitSayUtterances("Hello. World"), ["Hello.", "World"])
+        XCTAssertEqual(
+            TextToSpeech.splitSayUtterances("Hello! World? Yes."),
+            ["Hello!", "World?", "Yes."])
+        XCTAssertEqual(
+            TextToSpeech.splitSayUtterances("3.14 is pi."), ["3.14 is pi."])
+        XCTAssertEqual(
+            TextToSpeech.splitSayUtterances("Warning: the core is hot."),
+            ["Warning:", "the core is hot."])
     }
 
     // MARK: - Static Query Tests
@@ -275,10 +303,11 @@ final class TextToSpeechTests: XCTestCase {
     }
 
     @available(iOS 15.0, macOS 12.0, *)
-    func testLoadingInCloneModeWaitsForAVoice() async throws {
+    func testLoadingInCloneModeBuildsZipVoiceReadyForCapture() async throws {
         let dataPath = try Self.getTtsDataPath()
-        // There is no engine to build until cloneFrom() supplies a reference
-        // voice, so load() prepares the assets rather than failing.
+        // cloning() before load() fetches ZipVoice (plus clone ASR) with a
+        // built-in preset so startCloning() / synthesize work immediately;
+        // cloneFrom() later swaps in the user's reference clip.
         let tts = TextToSpeech()
             .language("en_us")
             .cloning()
@@ -287,10 +316,9 @@ final class TextToSpeechTests: XCTestCase {
 
         try await tts.load()
         XCTAssertFalse(tts.isCloned)
-        XCTAssertThrowsError(try tts.synthesize("Hello")) { error in
-            XCTAssertTrue("\(error)".contains("cloneFrom()"),
-                          "Expected the error to point at cloneFrom(), got \(error)")
-        }
+        _ = tts.startCloning()
+        let result = try tts.synthesize("Hello")
+        XCTAssertGreaterThan(result.samples.count, 0)
     }
 
     // MARK: - Device Enumeration (macOS only)

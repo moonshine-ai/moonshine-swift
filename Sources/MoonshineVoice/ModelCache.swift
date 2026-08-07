@@ -41,11 +41,15 @@ public enum ModelCache {
             // Voices of a language share one G2P root (the manifest lays them out under distinct
             // key prefixes), so the directory is keyed by language only.
             return sanitize("tts-\(language)")
-        case .intent(let modelName, let variant):
+        case .embedding(let modelName, let variant):
+            // Keeps the historical "intent-" prefix so caches downloaded by
+            // earlier releases are still found rather than re-fetched.
             let parts = ["intent", modelName, variant ?? "default"]
             return sanitize(parts.joined(separator: "-"))
         case .g2p(let language):
             return sanitize("g2p-\(language)")
+        case .diarization:
+            return "diarization-community1"
         }
     }
 
